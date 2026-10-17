@@ -284,6 +284,43 @@ if (reasoningStatus.body.phase !== 'streaming' || !(reasoningStatus.body.tokens 
 }
 try { await reasoningIt.return() } catch {}
 
+// 工具调用参数流（写文件）：DSH 抽象 StreamChunk 用 tool-call-delta /
+// argumentsDelta 承载文件正文。它同样是模型输出，必须刷新内容时钟并计入
+// 吞吐；否则写文件全程只收到 argumentsDelta，徽标会一直停在「正在等待模型」。
+const toolOptions = { sessionId: 's10-tool' }
+let releaseToolArgs = null
+const toolGate = new Promise((resolve) => { releaseToolArgs = resolve })
+const toolStream = (async function* () {
+  yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+  yield { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'write', argumentsDelta: '{"path":"a.md","content":"# 标题' }
+  await toolGate
+  yield { type: 'tool-call-delta', index: 0, id: 'call-1', argumentsDelta: '\n\n' + '正文内容'.repeat(200) + '"}' }
+  yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 812 } }
+})()
+const wrappedTool = streamListener(toolOptions, () => Promise.resolve(toolStream))
+const toolIt = wrappedTool[Symbol.asyncIterator]()
+await toolIt.next() // block-start
+await toolIt.next() // 首个参数增量
+await sleep(700) // 让速率窗口跨度超过 RATE_MIN_SPAN_MS
+releaseToolArgs()
+await toolIt.next() // 第二个参数增量
+const toolStatus = await call({ action: 'speed-status', args: { sessionId: 's10-tool' } })
+if (toolStatus.body.phase !== 'streaming') {
+  throw new Error('tool-call deltas must keep the badge streaming: ' + JSON.stringify(toolStatus.body))
+}
+if (!(toolStatus.body.tokens > 0)) {
+  throw new Error('tool-call arguments must count as generated output: ' + JSON.stringify(toolStatus.body))
+}
+if (!(toolStatus.body.tps > 0)) {
+  throw new Error('tool-call arguments must produce a throughput reading: ' + JSON.stringify(toolStatus.body))
+}
+await toolIt.next() // usage 收尾
+await toolIt.next() // 触发流结束（finally 标记 done）
+const toolDone = await call({ action: 'speed-status', args: { sessionId: 's10-tool' } })
+if (toolDone.body.phase !== 'done') throw new Error('tool-call stream should settle: ' + JSON.stringify(toolDone.body))
+if (toolDone.body.tokens !== 812) throw new Error('usage outputTokens should win over char estimate: ' + JSON.stringify(toolDone.body))
+try { await toolIt.return() } catch {}
+
 // 同一 session 的重叠流：旧流结束不能把新流误标成 done。
 const overlapOptions = { sessionId: 's10-overlap' }
 let releaseOld = null
